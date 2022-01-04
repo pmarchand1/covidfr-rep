@@ -1,0 +1,271 @@
+---
+title: "Ré-analyse du temps entre l'hospitalisation et la mortalité dans Salje et al. (2020)"
+author: "Philippe Marchand"
+date: "2022-01-04"
+output: 
+    html_document:
+        toc: true
+        toc_float: true
+---
+
+Ce document vise à reproduire la méthode utilisée par Salje et al. (2020) "Estimating the burden of SARS-CoV-2 in France" pour ajuster un modèle paramétrique à la distribution du délai entre l'arrivée à l'hôpital et le décès pour des patients atteints de COVID-19 en France. 
+
+Cette analyse n'apparaît que dans le supplément de l'article et ses résultats ne font pas partie du modèle principal de l'article (qui vise à estimer le changement du nombre de reproduction R0 avant et après le confinement). En fait, cette paramétrisation du délai entre hospitalisation et mortalité est plutôt utilisée dans un autre modèle du même article pour estimer le taux de mortalité après infection (Infection Fatality Rate). 
+
+Malgré le caractère secondaire de cette analyse dans l'étude originale, le fait que les paramètres rapportés dans l'article pour cette analyse ne produisent pas un bon ajustement aux données, tel que précédemment discuté dans la critique de Vincent Pavan, "Demande de rétractation de l'article: Estimating the burden of SARS-CoV-2 in France", justifie un examen particulier de cette portion de l'étude, afin que des correctifs soient appliqués. 
+
+La ré-analyse qui suit montrera que la méthodologie de l'étude permet bien d'obtenir un bon ajustement aux données; cependant, les paramètres du modèle ainsi ajusté ne sont pas compatibles avec ceux rapportés par les auteurs. Comme il sera expliqué plus loin, cela porte à conclure à une erreur dans le codage de l'analyse par les auteurs, bien que seule une vérification du code original (non publié pour cette analyse) pourrait le confirmer.
+
+Finalement, je discuterai brièvement d'une erreur dans la solution alternative du problème présentée par Vincent Pavan (basée sur la juxtaposition de deux distributions tronquées et résolue par la méthode des moments), dont la correction devrait aussi améliorer l'ajustement du modèle aux données.
+
+# Préparation des données
+
+Utilisons les données publiées par les auteurs de l'étude sur Zenodo (https://dx.doi.org/10.5281/zenodo.3889894, version 1.1), plus spécifiquement les fichiers `delay_observed_hosp_death_by_age.csv` (nombre de décès par groupe d'âge en fonction du nombre de jours écoulés) et `dailyHospCounts.csv` (nombre quotidien d'hospitalisations).
+
+Voici les packages R requis pour ce document.
+
+```{r, warning = FALSE, message = FALSE}
+library(readr)
+library(dplyr)
+library(ggplot2)
+theme_set(theme_bw())
+```
+
+D'abord, pour le tableau des décès par groupe d'âge en fonction du délai depuis l'arrivée à l'hôpital:
+
+```{r, message = FALSE, warning = FALSE}
+deces_delai <- read_csv2("delay_observed_hosp_death_by_age.csv",
+                         name_repair = "minimal")
+head(deces_delai)
+````
+
+Donnons un nom plus court à la première colonne et calculons le total des décès par rangée (tous âges confondus).
+
+```{r}
+colnames(deces_delai)[1] <- "delai"
+deces_delai$total <- rowSums(deces_delai[, -1])
+head(deces_delai)
+```
+
+
+```{r}
+ggplot(deces_delai, aes(x = delai, y = total)) +
+    geom_col() +
+    labs(x = "Nombre de jours depuis l'arrivée à l'hôpital", 
+         y = "Nombre de décès")
+```
+
+**Fig.1: Distribution des décès totaux en fonction du nombre de jours écoulés à l'hôpital**
+
+<br>
+
+Calculons aussi le total des hospitalisations quotidiennes, tous âges confondus:
+
+```{r, message  = FALSE, warning = FALSE}
+hosp <- read_csv("dailyHospCounts.csv", name_repair = "minimal")
+hosp$total <- rowSums(hosp[, -1])
+head(hosp)
+```
+
+Dérivons aussi deux variables qui seront utiles pour l'analyse:
+
+- le délai entre chaque date d'hospitalisation et la dernière date disponible dans les données (`max_delai`), représentant le délai maximal entre l'hospitalisation et la mortalité qui aurait pu être observé pour les individus hospitalisés ce jour-là; et 
+
+- le nombre cumulatifs d'individus dans le jeu de données pour chaque valeur du délai (`n_delai`).
+
+```{r}
+hosp <- mutate(hosp, max_delai = max(Date) - Date,
+               n_delai = cumsum(total))
+hosp <- select(hosp, Date, total, max_delai, n_delai) 
+head(hosp)
+```
+
+Donc par exemple ici, 39 hospitalisations ont un `max_delai` de 67 jours et 60 ont un `max_delai` de 66 jours, donc 99 (cumul.) auraient pu être observées pendant 66 jours ou plus.
+
+Pour le modèle plus tard, il sera plus utile d'ordonner ces données en fonction de `max_delai` (donc l'inverse de l'ordre actuel):
+
+```{r}
+hosp <- arrange(hosp, max_delai)
+head(hosp)
+```
+
+
+```{r}
+ggplot(hosp, aes(x = max_delai, y = n_delai)) +
+    geom_point() +
+    geom_line() +
+    labs(x = "Délai", y = "Nombre d'hospitalisations cumulatives")
+```
+
+**Fig.2: Distribution du nombre d'hospitalisations cumulatives en fonction du délai entre l'hospitalisation et la dernière date observée (nombre d'observations où le délai maximal observable est plus grand ou égal à une valeur du délai donné).**
+
+<br>
+
+# Résumé de la méthode de Salje et al. (2020)
+
+*Note*: L'analyse originale effectuée par les auteurs est décrite de façon très sommaire dans le supplément de l'article et le code correspondant n'est pas disponible. La description ci-dessous correspond donc à ma compréhension de la méthode selon les informations disponibles.
+
+D'abord, les auteurs proposent une distribution pour le délai $t$ entre l'arrivée à l'hôpital et la mort, pris comme une variable continue qui n'est pas directement observée. Cette distribution ($\pi^{true}$ dans la notation des auteurs) est le mélange d'une distribution exponentielle (fraction $1 - \rho$ des cas) pour représenter le mode à 0 et d'une distribution log-normale (fraction $\rho$ des cas) pour représenter le mode secondaire (autour de $t = 2$) et la décroissance de la mortalité pour de longs délais.
+
+$$\pi^{true} = (1 - \rho) \; Exp(m) + \rho \; Lognormal(\mu, \sigma^2)$$
+
+*Note*: Dans cette équation et les suivantes, j'omet l'indice $i$ pour le groupe d'âge.
+
+Ensuite, ils dérivent la proportion attendue des cas, $\pi^{exp}(k)$, dans chaque intervalle de temps correspondant à un jour entier, donc des intervalles de la forme $k < t \leq k+1$ pour $k = 0, 1, 2, ..., T - 1$. Ici, $T$ a pour effet de tronquer la distribution $\pi^{true}$ et devrait être suffisamment grand pour que la probabilité que $t > T$ soit négligeable.
+
+Si $\pi^{exp}$ correspondait seulement à la discrétisation de $\pi^{true}$, alons on aurait:
+
+$$\pi_*^{exp}(k) = \Pi^{true}(k+1) - \Pi^{true}(k)$$
+
+où $\Pi^{true}$ (en suivant la notation des auteurs) est la probabilité cumulative associée à $\pi^{true}$. Ici j'utilise $\pi_*^{exp}$ (avec l'astérisque) pour représenter la distribution non-corrigée pour le biais d'observation (ci-dessous).
+
+Cependant, les auteurs considèrent également le biais dû au fait que les longs délais entre l'hospitalisation et la mort sont sous-représentés dans les données observées par rapport à leur poids réel. 
+
+Prenons $N(k)$ comme le nombre d'hospitalisations avec un délai d'au moins $k$ jours entre la date d'hospitalisation et la dernière date disponible (c'est la quantité représentée en Fig. 2). Remarquons par exemple que $N(k)$ est environ 2 fois plus grand pour $k = 20$ que $k = 40$. Donc il y a $N(20)$ cas pour lesquels tous les décès survenant entre 19 et 20 jours après l'arrivée seraient observés, mais il y a seulement $N(40)$ cas (un sous-ensemble des $N(20)$, nécessairement) pour lesquels un décès survenant entre 39 et 40 jours serait observé. Autrement dit, le rapport entre les décès attendus pour différents délais n'est pas donné directement par le rapport des $\pi_*^{exp}$ (équation ci-dessus), mais doit être pondéré par le nombre de cas où un chaque événement aurait pu être observé dans la période à l'étude.
+
+$$\frac{\pi^{exp}(k)}{\pi^{exp}(l)} = \frac{N(k + 1) \; \pi_*^{exp}(k)}{N(l + 1) \; \pi_*^{exp}(l)}$$ 
+
+Donc la probabilité qu'un décès soit observé dans chaque intervalle $k$ est proportionnelle à un terme $N(k + 1) \pi_*^{exp}(k)$ et il suffit de diviser par la somme de ces termes (facteur de normalisation) pour obtenir une distribution de probabilité:
+
+$$\pi^{exp}(k) = \frac{N(k + 1) \; \pi_*^{exp}(k)}{\sum_{l=0}^{T-1}{N(l + 1) \pi_*^{exp}(l)}}$$ 
+
+Même si la notation diffère, cette expression est équivalente à celle présentée par les auteurs pour $\pi^{exp}$.
+
+Quelques notes avant de poursuivre:
+
+- Il y a aussi une autre composante implicite au modèle qui n'est pas formellement décrite par les auteurs: la variation aléatoire du nombre de décès observé dans chaque intervalle, autour de la moyenne attendue par le modèle. Ainsi, l'affirmation des auteurs: "For the correct pdf $\Pi_i^{true}$, we should have $\pi_i^{exp} = \pi_i^{obs}$." n'est pas exacte. Non seulement le modèle "correct" n'est pas accessible (le modèle paramétrique sert toujours à simplifier la réalité), mais même si on pouvait concevoir qu'il existe une vraie distribution au niveau de la population, tout échantillon observé de la population présentera une certaine variation aléatoire. Si on utilisait une méthode comme le maximum de vraisemblance (plutôt que celle des moindres carrés) pour ajuster les paramètres du modèle, il faudrait choisir explicitement une loi de probabilité pour décrire cette variation du nombre de décès observés dans chaque intervalle autour de la moyenne attendue par le modèle.
+
+- L'utilisation des nombres d'hospitalisations observés dans le temps pour pondérer le nombre de décès attendus en fonction du délai suppose que le taux de mortalité conditionnel à l'hospitalisation est constant dans le temps. Il s'agit d'une limite importante de ce modèle et de la nature des données (la distribution des décès dans le temps n'est pas connue). Différents facteurs influençant la mortalité risquent de varier au cours d'une épidémie (ex.: rapidité avec laquelle une personne se présente à l'hôpital, connaissance de la maladie permettant un meilleur traitement, surcharge des hôpitaux en fonction du nombre de cas). Toutefois, il est raisonnable de penser que les mêmes facteurs pourraient aussi influencer le délai entre hospitalisation et décès; autrement dit, la stationnarité des paramètres dans le temps est une supposition présente dans l'ensemble du modèle, que l'on applique ou non la correction basée sur les $N$.
+
+# Application de la méthode aux données
+
+À l'instar de Vincent Pavan, je vais seulement tester la méthode avec les décès totaux (non divisés par classe d'âge). Comme pour l'article original, la distribution est tronquée à $T = 60$ (donc les délais possibles sont de 0 à 59, représentant les classes de 0 à 1 jour jusqu'à 59 à 60 jours).
+
+Voici les données nécessaires tirées des tableaux créés dans la première section.
+
+```{r}
+# Valeurs de k (définissent les intervalles k < t <= k+1)
+# avec distribution tronquée à T = 60 
+delais <- 0:59
+# Nombre de décès pour chaque k (il faut ajouter des zéros pour arriver à k = 59)
+n_dec <- c(deces_delai$total, rep(0, 24))
+# Proportion des décès pour chaque k
+pi_obs <- n_dec / sum(n_dec)
+# Valeurs de N(k+1)
+n_delai <- hosp$n_delai[2:61]
+```
+
+Je définis une section pour calculer les proportions $\pi_*^{exp}$ (non-corrigées) à partir des paramètres, puis les proportions corrigées et finalement une fonction objectif à minimiser (somme des écarts carrés, comme dans l'étude originale). 
+
+```{r}
+# Fonction pour calculer pi_exp avant correction
+calc_pi_exp_noncor <- function(pars) {
+    # Extraire les paramètres du vecteur pars
+    rho <- pars[1]
+    m <- pars[2]
+    mu <- pars[3]
+    sigma <- pars[4]    
+    # Calculer pi_exp avant la correction
+    pi_exp_noncor <- (1-rho) * (pexp(delais + 1, 1/m) - pexp(delais, 1/m)) +
+                    rho * (plnorm(delais + 1, mu, sigma) - plnorm(delais, mu, sigma))
+    pi_exp_noncor
+}
+
+# Fonction pour effectuer la correction des pi_exp en fonction des n_hosp
+calc_pi_exp_cor <- function(pi_exp_noncor) {
+    (n_delai * pi_exp_noncor) / sum(n_delai * pi_exp_noncor)
+}
+
+# Fonction objectif à minimiser (somme des écarts carrés)
+fonc_obj <- function(pars) {
+    pi_exp_noncor <- calc_pi_exp_noncor(pars)
+    pi_exp_cor <- calc_pi_exp_cor(pi_exp_noncor)
+    sum((pi_obs - pi_exp_cor)^2)
+}
+```
+
+La fonction `optim` dans R est utilisée pour déterminer la valeur des paramètres au minimum, en choisissant des valeurs initiales arbitraires d'ordre de grandeur raisonnable pour chaque paramètre (0.5 pour $\rho$ et 1 pour tous les autres) et des bornes inférieures et supérieures très larges (-10 et 10, sauf quand la borne est fixée par la nature du paramètre, donc 0 à 1 pour $\rho$ et un minimum de 0 pour $m$ et $\sigma$). 
+
+```{r}
+fit <- optim(par = c(rho = 0.5, m = 1, mu = 1, sigma = 1), 
+             fn = fonc_obj, method = "L-BFGS-B",
+             lower = c(rho = 0, m = 0, mu = -10, sigma = 0),
+             upper = c(rho = 1, m = 10, mu = 10, sigma = 10))
+```
+
+Voici la valeur des paramètres obtenus.
+
+```{r}
+fit$par
+```
+
+On peut ensuite calculer les valeurs attendues $\pi^{exp}$ avec et sans la correction basée sur les $N(k)$ et les comparer graphiquement aux observations dans chaque intervalle. 
+
+```{r}
+pi_exp_noncor <- calc_pi_exp_noncor(fit$par)
+pi_exp_cor <- calc_pi_exp_cor(pi_exp_noncor)
+```
+
+
+
+```{r}
+ggplot(NULL, aes(x = delais)) +
+    geom_col(aes(y = pi_obs), alpha = 0.5) +
+    geom_line(aes(y = pi_exp_noncor), size = 1, linetype = "dashed") +
+    geom_line(aes(y = pi_exp_cor), size = 1)
+```
+
+**Fig.3: Proportion des décès observés en fonction du délai en jours (barres), proportions prévues par le modèle avant (tirets) et après (ligne pleine) correction.**
+
+<br>
+
+On voit une bonne correspondance entres les valeurs attendues et observées, malgré que le deuxième mode (de la distribution log-normale) soit un peu plus à droite que celui observé. Le fait que les courbes avant et après correction soient relativement proches n'est pas surprenant vu que le pic d'hospitalisations survient environ au milieu de la période observée, donc la grande majorité des hospitalisations ont lieu plus de 20 jours avant la fin de cette période. La différence entre les deux courbes est plus importante (relativement parlant) pour les délais élevés où il n'y a presque pas de décès observés et très peu d'attendus.
+
+```{r}
+ggplot(NULL, aes(x = delais)) +
+    geom_col(aes(y = pi_obs), alpha = 0.5) +
+    geom_line(aes(y = pi_exp_noncor), size = 1, linetype = "dashed") +
+    geom_line(aes(y = pi_exp_cor), size = 1) +
+    coord_cartesian(ylim = c(0, 0.01))
+```
+
+**Fig.4: Zoom sur la partie inférieure de la Fig.3.**
+
+<br>
+
+Néanmoins, puisque la distribution log-normale est asymétrique et que sa moyenne est sensible aux valeurs extrêmes, la correction a un impact sur le délai moyen attendu.
+
+*Note:* J'approxime le calcule de la moyenne attendue ici en fixant la valeur de $t$ au milieu de chaque intervalle (delais + 0.5).
+
+```{r}
+paste0("Délai moyen observé: ", round(sum(pi_obs * (delais + 0.5)), 3))
+paste0("Délai moyen attendu après correction: ", round(sum(pi_exp_cor * (delais + 0.5)), 3))
+paste0("Délai moyen attendu avant correction: ", round(sum(pi_exp_noncor * (delais + 0.5)), 3))
+```
+
+Autrement dit, le modèle prévoit que le délai moyen (discrétisé) entre l'hospitalisation et le décès est d'environ 6.4 jours, mais qu'en raison du biais d'observation où certains longs délais ne sont pas observés, le délai moyen observé sera plutôt de 6.0 jours. Cette valeur demeure légèrement supérieure au délai moyen observé de 5.9 jours.
+
+# Non-concordance avec les paramètres rapportés
+
+Ainsi, la méthode présentée par les auteurs permet bien d'approximer la distribution du délai entre arrivée à l'hôpital et décès, mais avec des paramètres qui diffèrent considérablement de ceux rapportés par les auteurs de l'étude originale. Par exemple, ils rapportent un délai moyen d'environ 10 jours pour tous les groupes d'âge confondus. 
+
+Comme il a déjà été mentionné par Vincent Pavan, les données publiées que nous utilisons ici ne sont pas identiques à celles utilisées dans l'article, puisque le nombre de décès total observé (9976) est plus grand selon les valeurs rapportées dans l'article (11324). Cependant, il semble extrêmement improbable qu'une augmentation de 10% de la taille du jeu de données change les estimés à ce point, surtout que les graphiques publiés sont qualitativement très semblables à ceux produits ici.
+
+Dans ce cas, ma principale hypothèse sur la source de cette non-concordance serait celle d'une erreur dans le code utilisé par les auteurs, possiblement dans le calcul du facteur de correction impliquant le nombre d'hospitalisations dans le temps. En effet, une erreur au niveau de ce calcul modifierait la correspondance entre la valeur des paramètres du modèle et la forme de la courbe $\pi^{exp}$ qui est utilisée pour approximer $\pi^{obs}$, donc même si la méthode des moindres carrés produira un bon ajustement, les paramètres indiqués pour cet ajustement seraient incorrects.
+
+
+# Note sur la solution alternative de Vincent Pavan (méthode des moments)
+
+Tel que mentionné plus haut, les auteurs de l'étude originale proposent comme distribution pour le délai entre hospitalisation et décès un mélange de deux distributions élémentaires (exponentielle et log-normale).
+
+$$\pi^{true} = (1 - \rho) \; Exp(m) + \rho \; Lognormal(\mu, \sigma^2)$$
+
+En particulier, ces distributions sont définies pour toutes les valeurs positives de $t$ et le nombre de décès observé pour chaque intervalle est la somme des contributions des deux distributions. Donc même si la distribution exponentielle contribue beaucoup plus aux décès observés dans les délais courts et la distribution log-normale contribue plus aux décès observés avec un délai plus long, on ne peut pas dire pour un décès donné de quelle distribution il vient (surtout dans la partie où les deux distributions ont une probabilité non-négligeable).
+
+Au lieu de cette superposition de deux distributions, le Pr. Pavan propose plutôt que la distribution exponentielle s'applique aux décès avec un délai de moins de 2 jours et la distribution log-normale aux délais de 2 jours et plus. Autrement dit, on a une distribution exponentielle tronquée avec $0 \leq t < 2$ et une distribution log-normale tronquée avec $t \geq 2$. Ici, puisque les deux distributions sont tronquées sur des portions distinctes de l'axe $t$, on sait par définition que les décès pour $k = 0$ et $k = 1$ proviennent de la distribution exponentielle, tandis que ceux pour des $k$ plus élevés proviennent de la distribution log-normale. Cela lui permet d'appliquer la méthode des moments, consistant à apparier le premier moment observé pour $t < 2$ à celui de la distribution exponentielle, puis les deux premiers moments observés pour $t \geq 2$ aux moments correspondants de la distribution log-normale.
+
+Le problème vient du fait qu'il va apparier les moments observés non pas aux distributions exponentielle et log-normale tronquées, mais aux moments des distributions complètes définies entre sur tout l'axe $t$ positif. Pourtant, si on prend une distribution exponentielle et qu'on tronque la partie avec $t \geq 2$, alors la moyenne de la distribution tronquée devra être inférieure au paramètre $m$ et c'est à cette moyenne, pas à $m$, qu'il faut faire correspondre le délai moyen des décès observés dans l'intervalle [0, 2). 
+
+Il semble probable que ce soit cette erreur, plutôt que l'utilisation de la méthode des moments en tant que tel, qui cause un écart plus prononcé entre les distributions attendues et observées dans la solution de Vincent Pavan (l'exponentielle descend trop vite et le mode log-normal est plus à droite, créant une "vallée" dans la courbe pour $k = 1$ et $k = 2$).
+
+De plus, je note que même si le délai moyen attendu selon le modèle ajusté par cette méthode correspond à celui observé, le calcul des décès attendus dans chaque intervalle dans le code du Pr. Pavan (fonction barP) utilise une superposition des deux distributions sur l'ensemble des valeurs de $t$, oubliant qu'elles ont été tronquées dans son énoncé initial du problème. Dans ce cas la correspondance masque la même erreur appliquée à plusieurs endroits dans la démarche.
